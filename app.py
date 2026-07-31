@@ -1,138 +1,207 @@
-﻿%%writefile app.py
 import streamlit as st
 import pandas as pd
-import numpy as np
 import plotly.express as px
+import numpy as np
+import os
+from scipy.optimize import milp, LinearConstraint, Bounds
 
-st.set_page_config(page_title='IPL Value Engineering Dashboard', page_icon='🏏', layout='wide')
+# 1. Page Config
+st.set_page_config(page_title="IPL Moneyball Engine", layout="wide", page_icon="🏏")
 
+# 2. Robust Data Loading
 @st.cache_data
-def load_data():
-    df = pd.read_csv('cleaned_ipl_metrics_2024.csv')
+def load_and_prep_data():
+    csv_file = "cleaned_ipl_metrics_2024.csv"
+    if not os.path.exists(csv_file):
+        st.error(f"⚠️ Could not find `{csv_file}` in the directory. Please ensure it is uploaded to your GitHub repository.")
+        st.stop()
 
-    for col in ['Sold Price (Rs)', 'Total Runs Scored', 'Total Wickets Taken', 'Cost Per Run', 'Cost Per Wicket', 'Contribution Per Crore']:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+    df = pd.read_csv(csv_file)
 
+    df = df.rename(columns={
+        "COST IN ₹ (CR.)": "Cost_Cr",
+        "Total Contributions": "Total_Impact",
+        "Contribution Per Crore": "Value_Score",
+        "TYPE": "Role"
+    })
+
+    df = df.dropna(subset=['Cost_Cr', 'Total_Impact', 'Role', 'player_name']).copy()
+
+    df['Role'] = df['Role'].astype(str).str.strip().str.upper()
+    # Fill any gaps in secondary fields rather than dropping rows over them
+    if 'Value_Score' in df.columns:
+        df['Value_Score'] = df['Value_Score'].fillna(0)
     if 'Team' in df.columns:
-        df['Team'] = df['Team'].astype(str).str.strip()
+        df['Team'] = df['Team'].fillna("Unknown")
 
-    if 'player_name' in df.columns:
-        df['player_name'] = df['player_name'].astype(str).str.strip()
+    df['Plotly_Size'] = np.clip(df['Value_Score'], 0.1, None)
 
     return df
 
-df = load_data()
+df = load_and_prep_data()
 
-st.title('IPL Value Engineering Dashboard')
-st.markdown('Interactive analytics for auction value, player output, and franchise efficiency.')
+ROLE_COLORS = {
+    "BATTER": "#636EFA",
+    "BOWLER": "#EF553B",
+    "ALL-ROUNDER": "#00CC96",
+    "WICKETKEEPER": "#AB63FA"
+}
+# Any role value not in the map above still gets a color instead of breaking the chart
+FALLBACK_PALETTE = px.colors.qualitative.Set2
+unmapped_roles = [r for r in df['Role'].unique() if r not in ROLE_COLORS]
+for i, r in enumerate(unmapped_roles):
+    ROLE_COLORS[r] = FALLBACK_PALETTE[i % len(FALLBACK_PALETTE)]
 
-all_teams = sorted([t for t in df['Team'].dropna().unique().tolist() if t not in ['', 'None', 'Unsold']])
-selected_teams = st.sidebar.multiselect('Franchise / Team', all_teams, default=all_teams)
+# 3. Header
+st.title("🏏 IPL Auction: Moneyball Squad Optimizer")
+st.caption("Data-Driven Resource Allocation & Integer Programming for Franchise Management")
+st.divider()
 
-filtered_df = df[df['Team'].isin(selected_teams)].copy() if selected_teams else df.iloc[0:0].copy()
+tab1, tab2 = st.tabs(["⚡ Squad Optimizer (ILP)", "🔍 Player Valuation & Search"])
 
-if filtered_df.empty:
-    st.warning('No data available for the selected team filter.')
-    st.stop()
+# ==========================================
+# TAB 1: INTEGER PROGRAMMING OPTIMIZER
+# ==========================================
+with tab1:
+    st.subheader("🎯 Mathematical Squad Builder")
+    st.markdown(
+        "Set your total purse and minimum role counts. The algorithm solves a "
+        "**0/1 Knapsack Optimization Problem** to build the highest-impact squad possible "
+        "under those constraints."
+    )
 
-team_spend = filtered_df['Sold Price (Rs)'].fillna(0).sum()
-team_runs = filtered_df['Total Runs Scored'].fillna(0).sum()
-team_wickets = filtered_df['Total Wickets Taken'].fillna(0).sum()
-overall_cpr = team_spend / team_runs if team_runs else np.nan
+    col_a, col_b = st.columns(2)
+    with col_a:
+        total_purse = st.number_input("Total Purse Budget (₹ Crores)", min_value=1.0, max_value=150.0, value=25.0, step=1.0)
+    with col_b:
+        squad_size = st.slider("Target Squad Size", min_value=3, max_value=11, value=7)
 
-kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-kpi1.metric('Total Spend', f'₹{team_spend:,.0f}')
-kpi2.metric('Total Runs', f'{team_runs:,.0f}')
-kpi3.metric('Total Wickets', f'{team_wickets:,.0f}')
-kpi4.metric('Overall Financial Efficiency', f'₹{overall_cpr:,.2f} per run' if pd.notna(overall_cpr) else 'N/A')
+    st.markdown("**Minimum players required per role** (set 0 to leave unconstrained):")
+    role_cols = st.columns(4)
+    role_quota_inputs = {}
+    known_roles = ["BATTER", "BOWLER", "ALL-ROUNDER", "WICKETKEEPER"]
+    for i, role in enumerate(known_roles):
+        with role_cols[i]:
+            available = int((df['Role'] == role).sum())
+            role_quota_inputs[role] = st.number_input(
+                f"Min {role.title()}s", min_value=0, max_value=max(available, 0),
+                value=min(1, available), step=1, key=f"quota_{role}"
+            )
 
-st.markdown('### Player Value Scatter Plots')
-plot_left, plot_right = st.columns(2)
+    quota_sum = sum(role_quota_inputs.values())
+    if quota_sum > squad_size:
+        st.warning(
+            f"Your role minimums add up to {quota_sum}, which is more than your squad size of "
+            f"{squad_size}. The optimizer will report infeasibility unless you adjust one of these."
+        )
 
-batsmen_df = filtered_df[(filtered_df['Total Runs Scored'].fillna(0) > 0) & (filtered_df['Sold Price (Rs)'].fillna(0) > 0)].copy()
+    run_clicked = st.button("🚀 Run Squad Optimizer", type="primary")
 
-fig_bat = px.scatter(
-    batsmen_df,
-    x='Total Runs Scored',
-    y='Sold Price (Rs)',
-    color='Team',
-    hover_data=['player_name', 'Total Wickets Taken', 'Cost Per Run', 'Cost Per Wicket'],
-    title='Batsmen Value Map',
-    labels={'Total Runs Scored': 'Total Runs Scored', 'Sold Price (Rs)': 'Sold Price (Rs)'},
-    template='plotly_white'
-)
+    if run_clicked:
+        n = len(df)
+        c = -df['Total_Impact'].values  # maximize impact == minimize negative impact
+        costs = df['Cost_Cr'].values
 
-fig_bat.add_annotation(
-    text='Bottom-right quadrant = Hidden Gems',
-    xref='paper',
-    yref='paper',
-    x=0.98,
-    y=0.02,
-    showarrow=False,
-    align='right',
-    font=dict(size=12, color='gray')
-)
+        A_rows = [costs, np.ones(n)]
+        lb = [0, squad_size]
+        ub = [total_purse, squad_size]
 
-fig_bat.update_layout(height=550, legend_title_text='Franchise / Team')
+        for role, min_count in role_quota_inputs.items():
+            if min_count > 0:
+                A_rows.append((df['Role'] == role).astype(int).values)
+                lb.append(min_count)
+                ub.append(np.inf)
 
-bowlers_df = filtered_df[(filtered_df['Total Wickets Taken'].fillna(0) > 0) & (filtered_df['Sold Price (Rs)'].fillna(0) > 0)].copy()
+        A = np.vstack(A_rows)
+        constraints = LinearConstraint(A, lb=lb, ub=ub)
+        integrality = np.ones(n)
+        bounds = Bounds(0, 1)
 
-fig_bowl = px.scatter(
-    bowlers_df,
-    x='Total Wickets Taken',
-    y='Sold Price (Rs)',
-    color='Team',
-    hover_data=['player_name', 'Total Runs Scored', 'Cost Per Run', 'Cost Per Wicket'],
-    title='Bowlers Value Map',
-    labels={'Total Wickets Taken': 'Total Wickets Taken', 'Sold Price (Rs)': 'Sold Price (Rs)'},
-    template='plotly_white'
-)
+        res = milp(c=c, integrality=integrality, constraints=constraints, bounds=bounds)
 
-fig_bowl.add_annotation(
-    text='Bottom-right quadrant = Hidden Gems',
-    xref='paper',
-    yref='paper',
-    x=0.98,
-    y=0.02,
-    showarrow=False,
-    align='right',
-    font=dict(size=12, color='gray')
-)
+        if res.success:
+            selected_indices = np.where(res.x > 0.5)[0]
+            opt_squad = df.iloc[selected_indices].copy()
+            st.session_state["opt_squad"] = opt_squad
+            st.session_state["opt_purse"] = total_purse
+        else:
+            st.session_state["opt_squad"] = None
+            st.error(
+                "No valid squad could be built within these constraints. Try increasing the "
+                "purse, reducing role minimums, or adjusting squad size."
+            )
 
-fig_bowl.update_layout(height=550, legend_title_text='Franchise / Team')
+    # Persisted display: survives reruns triggered by other widgets (e.g. tab2 search box)
+    opt_squad = st.session_state.get("opt_squad")
+    if opt_squad is not None and not opt_squad.empty:
+        used_purse = st.session_state.get("opt_purse", total_purse)
+        used_budget = round(opt_squad['Cost_Cr'].sum(), 2)
+        total_impact = round(opt_squad['Total_Impact'].sum(), 2)
 
-plot_left.plotly_chart(fig_bat, use_container_width=True)
-plot_right.plotly_chart(fig_bowl, use_container_width=True)
+        st.success(
+            f"Optimized Squad: Total Spend ₹{used_budget} Cr / ₹{used_purse} Cr | "
+            f"Predicted Impact: {total_impact}"
+        )
 
-st.markdown('### Leaderboards')
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Selected Players", len(opt_squad))
+        m2.metric("Remaining Purse", f"₹{round(used_purse - used_budget, 2)} Cr")
+        m3.metric("Avg Value Rating", round(opt_squad['Value_Score'].mean(), 2))
 
-paid_df = filtered_df.copy()
-paid_df = paid_df[paid_df['Sold Price (Rs)'].fillna(0) > 0].copy()
-paid_df = paid_df[~paid_df['Team'].astype(str).str.upper().isin(['UNSOLD'])].copy()
+        role_breakdown = opt_squad['Role'].value_counts().to_dict()
+        st.caption("Role mix: " + ", ".join(f"{k}: {v}" for k, v in role_breakdown.items()))
 
-undervalued_batsmen = paid_df[(paid_df['Total Runs Scored'] >= 150) & (paid_df['Cost Per Run'].notna())].copy()
-undervalued_batsmen = undervalued_batsmen.sort_values(['Cost Per Run', 'Total Runs Scored'], ascending=[True, False]).head(5)
+        st.dataframe(
+            opt_squad[['player_name', 'Role', 'Cost_Cr', 'Total_Impact', 'Value_Score', 'Team']].reset_index(drop=True),
+            use_container_width=True
+        )
 
-undervalued_bowlers = paid_df[(paid_df['Total Wickets Taken'] >= 10) & (paid_df['Cost Per Wicket'].notna())].copy()
-undervalued_bowlers = undervalued_bowlers.sort_values(['Cost Per Wicket', 'Total Wickets Taken'], ascending=[True, False]).head(5)
+        csv_data = opt_squad.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Export Optimized Squad (CSV)", csv_data, "optimized_ipl_squad.csv", "text/csv")
 
-lb_left, lb_right = st.columns(2)
+# ==========================================
+# TAB 2: EXPLORATORY VISUALS & SEARCH
+# ==========================================
+with tab2:
+    st.subheader("📊 Individual Player Valuation & Filtering")
 
-show_bat_cols = ['player_name', 'Team', 'Total Runs Scored', 'Sold Price (Rs)', 'Cost Per Run', 'Contribution Per Crore']
-show_bowl_cols = ['player_name', 'Team', 'Total Wickets Taken', 'Sold Price (Rs)', 'Cost Per Wicket', 'Contribution Per Crore']
+    min_cost = float(df['Cost_Cr'].min())
+    max_cost = float(df['Cost_Cr'].max())
 
-lb_left.dataframe(
-    undervalued_batsmen[show_bat_cols].reset_index(drop=True),
-    use_container_width=True,
-    hide_index=True
-)
+    col_f1, col_f2 = st.columns([2, 1])
+    with col_f1:
+        search_query = st.text_input("🔍 Search Player Name", "")
+    with col_f2:
+        max_player_cost = st.slider(
+            "Max Single Player Cost (₹ Cr)",
+            min_value=min_cost, max_value=max_cost, value=max_cost
+        )
 
-lb_right.dataframe(
-    undervalued_bowlers[show_bowl_cols].reset_index(drop=True),
-    use_container_width=True,
-    hide_index=True
-)
+    filtered = df[df['Cost_Cr'] <= max_player_cost]
+    if search_query:
+        filtered = filtered[filtered['player_name'].str.contains(search_query, case=False, na=False)]
 
-st.markdown('### Notes')
-st.info('Hidden Gems are players in the bottom-right quadrant of each scatter plot: low auction cost with strong on-field output.')
+    if not filtered.empty:
+        fig = px.scatter(
+            filtered,
+            x="Cost_Cr",
+            y="Total_Impact",
+            color="Role",
+            size="Plotly_Size",
+            hover_name="player_name",
+            color_discrete_map=ROLE_COLORS,
+            hover_data={"Cost_Cr": True, "Total_Impact": True, "Value_Score": True, "Team": True, "Plotly_Size": False},
+            labels={"Cost_Cr": "Auction Cost (Crores ₹)", "Total_Impact": "On-Field Impact Score", "Role": "Player Role"},
+            template="plotly_dark",
+            title="Price vs. On-Field Impact (Top-Left Quadrant = Undervalued Gems)"
+        )
+        fig.add_hline(y=filtered['Total_Impact'].median(), line_dash="dot", line_color="gray")
+        fig.add_vline(x=filtered['Cost_Cr'].median(), line_dash="dot", line_color="gray")
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.dataframe(
+            filtered[['player_name', 'Role', 'Cost_Cr', 'Total_Impact', 'Value_Score', 'Team']].reset_index(drop=True),
+            use_container_width=True
+        )
+    else:
+        st.warning("No players match your search criteria.")
