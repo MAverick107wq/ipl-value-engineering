@@ -11,8 +11,7 @@ Fill in the two paths / column names marked TODO, then run:
 
 import pandas as pd
 
-# TODO: point this at your actual auction dataset
-DATA_PATH = "auction_data.csv"
+DATA_PATH = "cleaned_ipl_metrics_2024.csv"
 
 # TODO: set these to match your actual column names
 PRICE_COL = "price_crore"       # cost of the player in Crore
